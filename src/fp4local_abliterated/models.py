@@ -1,31 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen4Exp classes that attach abliteration after vLLM builds them.
+"""``Abliterated<Arch>`` subclasses for every architecture in adapters.py.
 
-``vllm.models.qwen4_exp`` resolves the platform's implementation, so these
-subclass whatever vLLM would have used.
+They are built on first lookup, so vLLM only imports the model code it serves,
+and they subclass whatever class vLLM itself resolves for the platform.
 """
 
-from vllm.config import VllmConfig
-from vllm.models import qwen4_exp
+import importlib
 
 from .ablation import attach_abliteration
+from .adapters import find_adapter
+
+PREFIX = "Abliterated"
 
 
-class AbliteratedQwen4ExpForCausalLM(qwen4_exp.Qwen4ExpForCausalLM):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        attach_abliteration(self, vllm_config.model_config.hf_text_config)
+def __getattr__(name: str):
+    adapter = find_adapter(name.removeprefix(PREFIX))
+    if not name.startswith(PREFIX) or adapter is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    base = getattr(importlib.import_module(adapter.module), name.removeprefix(PREFIX))
 
+    def __init__(self, *, vllm_config, prefix: str = "") -> None:
+        base.__init__(self, vllm_config=vllm_config, prefix=prefix)
+        attach_abliteration(self, vllm_config.model_config.hf_config, adapter)
 
-class AbliteratedQwen4ExpForConditionalGeneration(
-    qwen4_exp.Qwen4ExpForConditionalGeneration
-):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        attach_abliteration(self, vllm_config.model_config.hf_text_config)
-
-
-class AbliteratedQwen4ExpMTP(qwen4_exp.Qwen4ExpMTP):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        attach_abliteration(self, vllm_config.model_config.hf_text_config)
+    cls = type(name, (base,), {"__init__": __init__, "__module__": __name__})
+    globals()[name] = cls
+    return cls

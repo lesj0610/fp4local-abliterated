@@ -5,12 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fp4local-abliterated"
 version = "0.1.0"
-description = "vLLM plugin for Qwen3.8-Flash-Next FP4-Local: CSF scale loading and inference-time abliteration"
+description = "vLLM plugin for inference-time abliteration, with FP4-Local checkpoint loading"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-# vLLM is not a dependency on purpose: installing this plugin must never
-# replace the vLLM build that is already there (containers, source builds).
+# 0.32.0 has no NVFP4 PLE tables (vllm-project/vllm#56273) and allocates
+# FP4-Local's table as bf16, four times its size.
+dependencies = ["vllm>=0.32.1rc0"]
+
+[project.scripts]
+fp4local-abliterate = "fp4local_abliterated.cli:main"
 
 [project.entry-points."vllm.general_plugins"]
 fp4local_abliterated = "fp4local_abliterated:register"

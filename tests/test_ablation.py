@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from torch import nn
 
-from fp4local_abliterated.ablation import ablate
+from fp4local_abliterated.ablation import ablate, attach_abliteration
+from fp4local_abliterated.adapters import QWEN4EXP
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -44,3 +48,46 @@ def test_sharded_rows_are_rejected():
     x = torch.randn(3, 1280, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="full hidden rows"):
         ablate(x, torch.ones(2560, device="cuda"), 1.0)
+
+
+class PPMissingLayer(nn.Identity):
+    pass
+
+
+class Qwen4ExpDecoderLayer(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.self_attn = nn.Linear(hidden, hidden, bias=False)
+        self.mlp = nn.Linear(hidden, hidden, bias=False)
+
+
+class Qwen4ExpPLELayer(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.kv_proj = nn.Linear(hidden, 3 * hidden, bias=False)
+
+
+class Qwen4ExpModel(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.embed_tokens = PPMissingLayer()
+        self.layers = nn.ModuleList([Qwen4ExpDecoderLayer(hidden), Qwen4ExpPLELayer(hidden)])
+
+
+def test_hooks_follow_the_adapter():
+    torch.manual_seed(0)
+    hidden = 64
+    v = torch.randn(hidden)
+    v /= v.norm()
+    config = SimpleNamespace(abliteration_config={"direction": v.tolist(), "lambda": 1.0})
+    with torch.device("cuda"):
+        model = Qwen4ExpModel(hidden).to(torch.bfloat16)
+        attach_abliteration(model, config, QWEN4EXP)
+        x = torch.randn(5, hidden, dtype=torch.bfloat16)
+    layer, ple = model.layers
+    kv = ple.kv_proj(x)
+
+    for write in (layer.self_attn(x), layer.mlp(x), kv[:, -hidden:]):
+        assert (write.float() @ v.cuda()).abs().max() < 0.05
+    assert torch.equal(kv[:, :-hidden], (x @ ple.kv_proj.weight.T)[:, :-hidden])
+    assert torch.equal(model.embed_tokens(x), x)

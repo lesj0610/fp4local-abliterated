@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Inference-time abliteration for Qwen4Exp.
+"""Inference-time abliteration.
 
-Every write into the residual stream (token embedding, attention and linear
-attention output, MoE output, PLE value, MTP input projections) has its
-component along the refusal direction ``v`` scaled by ``1 - lam``:
-``x - lam * (v . x) v``. This equals editing those weights to
-``W - lam * v v^T W`` but leaves the quantized weights untouched. The writes
-are module outputs, so forward hooks apply it without touching vLLM's model
-code.
+Every write into the residual stream has its component along the refusal
+direction ``v`` scaled by ``1 - lam``: ``x - lam * (v . x) v``. This equals
+editing those weights to ``W - lam * v v^T W`` but leaves the quantized weights
+untouched. The writes are module outputs, so forward hooks apply it without
+touching vLLM's model code; adapters.py says which modules they are.
+
+The checkpoint enables it with a top-level ``abliteration_config`` block in
+config.json (``direction``: hidden_size floats, ``lambda``), written by the
+``fp4local-abliterate`` CLI.
 """
 
 import torch
@@ -15,6 +17,8 @@ from torch import nn
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+
+from .adapters import Adapter
 
 logger = init_logger(f"vllm.{__name__}")
 
@@ -70,66 +74,46 @@ def ablate(
     return x if inplace else out.view(x.shape)
 
 
-def _hook_output(owner: nn.Module, lam: float):
+def _hook(owner: nn.Module, lam: float, packed: bool):
     def hook(module, args, output):
-        if isinstance(output, tuple):
-            return (ablate(output[0], owner.ablit_direction, lam), *output[1:])
-        return ablate(output, owner.ablit_direction, lam)
+        out = output[0] if isinstance(output, tuple) else output
+        direction = owner.ablit_direction
+        if packed:
+            ablate(out[..., -direction.numel() :], direction, lam, inplace=True)
+            return output
+        out = ablate(out, direction, lam)
+        return (out, *output[1:]) if isinstance(output, tuple) else out
 
     return hook
 
 
-def _hook_ple_value(owner: nn.Module, lam: float, value_offset: int):
-    # kv_proj returns [key | value]; only the value half reaches the residual.
-    def hook(module, args, output):
-        kv = output[0] if isinstance(output, tuple) else output
-        ablate(kv[..., value_offset:], owner.ablit_direction, lam, inplace=True)
-        return output
-
-    return hook
-
-
-def attach_abliteration(model: nn.Module, text_config) -> None:
-    direction = getattr(text_config, "abliteration_direction", None)
-    if direction is None:
+def attach_abliteration(model: nn.Module, hf_config, adapter: Adapter) -> None:
+    config = getattr(hf_config, "abliteration_config", None)
+    if config is None:
         return
-    lam = float(getattr(text_config, "abliteration_lambda", 1.0))
-    direction = torch.tensor(direction, dtype=torch.float32)
+    lam = float(config["lambda"])
+    direction = torch.tensor(config["direction"], dtype=torch.float32)
     model.register_buffer(
         "ablit_direction", direction / direction.norm(), persistent=False
     )
-    hook = _hook_output(model, lam)
 
     sites = 0
     layers = 0
     for module in model.modules():
         kind = type(module).__name__
-        targets: list[nn.Module] = []
-        if kind == "Qwen4ExpDecoderLayer":
-            layers += 1
-            for name in ("linear_attn", "self_attn", "mlp"):
-                if hasattr(module, name):
-                    targets.append(getattr(module, name))
-        elif kind in ("Qwen4ExpModel", "Qwen4ExpMultiTokenPredictor"):
-            for name in ("embed_tokens", "fc_embedding", "fc_hidden"):
-                if hasattr(module, name):
-                    targets.append(getattr(module, name))
-        elif kind == "Qwen4ExpPLELayer":
-            value_offset = module.kv_proj.output_sizes[0]
-            module.kv_proj.register_forward_hook(
-                _hook_ple_value(model, lam, value_offset)
-            )
-            sites += 1
-        for target in targets:
-            if type(target).__name__ == "PPMissingLayer":
+        layers += kind == adapter.layer_class
+        for name in adapter.writers.get(kind, ()):
+            target = getattr(module, name, None)
+            if target is None or type(target).__name__ == "PPMissingLayer":
                 continue
-            target.register_forward_hook(hook)
+            packed = (kind, name) in adapter.packed_writers
+            target.register_forward_hook(_hook(model, lam, packed))
             sites += 1
 
     if layers == 0:
         raise RuntimeError(
-            f"{type(model).__name__} has abliteration fields in its config but no "
-            "Qwen4ExpDecoderLayer was found; this vLLM version is not supported"
+            f"{type(model).__name__} has an abliteration_config but no "
+            f"{adapter.layer_class} was found; this vLLM version is not supported"
         )
     logger.info(
         "Abliteration on %s: lambda %.4g, %d residual writes in %d layers",
