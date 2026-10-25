@@ -21,7 +21,7 @@ For a custom vLLM build whose version string does not satisfy the requirement, i
 The direction is an input; this package does not compute it. Given one (a 1-D tensor of `hidden_size` values in a `.pt` or `.safetensors` file):
 
 ```bash
-pip install git+https://github.com/lesj0610/fp4local-abliterated
+pip install fp4local-abliterated
 fp4local-abliterate <base checkpoint> <output dir> --direction v.pt --lambda 1.5 \
   --source "where the direction came from"
 ```
