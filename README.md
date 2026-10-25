@@ -2,7 +2,7 @@
 
 A vLLM plugin that removes a refusal direction at inference time, so quantized checkpoints can be abliterated without touching (or re-quantizing) their weights. It was written for [Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local), whose QAD-trained NVFP4 and MXFP8 weights would lose accuracy if they were dequantized, edited and quantized again.
 
-At each residual-stream writer listed for the architecture the plugin replaces the output `x` with `x − λ (vᵀx) v`, computed in fp32. That is the same as editing each writer to `W − λ v vᵀ W`, which is what weight-editing abliteration does, so it reaches the same writes. Writes no weight edit can reach stay as they are; for Qwen4Exp these are the PLE short-convolution output and the vision tower's embeddings and deepstack inputs.
+At each residual-stream writer listed for the architecture the plugin replaces the output `x` with `x − λ (vᵀx) v`, computed in fp32. That is the same as editing each writer to `W − λ v vᵀ W`, which is what weight-editing abliteration does. Residual writes outside that list are left as they are; for Qwen4Exp these are the PLE short-convolution output and the vision tower's embeddings and deepstack inputs.
 
 The plugin also loads FP4-Local's CSF-compressed NVFP4 scales and its `tensors/` shard layout, which vLLM releases do not read yet. That part is adapted from vLLM pull request #60646, wraps two internal methods of vLLM's default loader, and switches itself off once vLLM ships the feature.
 
