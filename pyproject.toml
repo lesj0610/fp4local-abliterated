@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fp4local-abliterated"
+version = "0.1.0"
+description = "vLLM plugin for Qwen3.8-Flash-Next FP4-Local: CSF scale loading and inference-time abliteration"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+# vLLM is not a dependency on purpose: installing this plugin must never
+# replace the vLLM build that is already there (containers, source builds).
+
+[project.entry-points."vllm.general_plugins"]
+fp4local_abliterated = "fp4local_abliterated:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
