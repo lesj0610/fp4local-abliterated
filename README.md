@@ -4,7 +4,7 @@ A vLLM plugin that removes a refusal direction at inference time, so quantized c
 
 At each residual-stream writer listed for the architecture the plugin replaces the output `x` with `x − λ (vᵀx) v`, computed in fp32. That is the same as editing each writer to `W − λ v vᵀ W`, which is what weight-editing abliteration does. Residual writes outside that list are left as they are; for Qwen4Exp these are the PLE short-convolution output and the vision tower's embeddings and deepstack inputs.
 
-The plugin also loads FP4-Local's CSF-compressed NVFP4 scales and its `tensors/` shard layout, which vLLM releases do not read yet. That part is adapted from vLLM pull request #60646, wraps two internal methods of vLLM's default loader, and switches itself off once vLLM ships the feature.
+The plugin also loads FP4-Local's CSF-compressed NVFP4 expert scales (`csf`, and `csf_32x2_v1` as used by GLM-5.3-Flash-FP4-Local) and finds the safetensors shards its index lists under `tensors/`, next to or instead of root shards. vLLM releases do not do either yet. The decoders match vLLM pull request #64312 and the shard lookup matches #64739. Both wrap internal functions of vLLM's default loader: the decoding switches itself off once vLLM has its own decoders, and the shard lookup changes nothing once vLLM finds those shards.
 
 ## Requirements
 

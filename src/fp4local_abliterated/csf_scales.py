@@ -1,25 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Adapted from vLLM pull request #60646 by Stefano Castagnetta (NVIDIA); drop
-# this module once a vLLM release ships model_loader/csf_scales.py.
-"""Load-time decoding of CSF-compressed NVFP4 block scales.
+# The decoders match vLLM pull request #64312 (its `csf` decoder comes from
+# #60646 by Stefano Castagnetta, NVIDIA). The loader skips this module once
+# vLLM has layers/quantization/utils/csf_scales.py.
+"""Decoders for CSF-compressed NVFP4 block scales.
 
-CSF checkpoints (``weight_scale_encoding: "csf"``, codec
-``byte-window4-fixed-stream-u24-exceptions/1``) store each E4M3 block-scale
-matrix as two tensors:
+ModelOpt checkpoints declare ``weight_scale_encoding`` per layer and store each
+E4M3 block-scale matrix as several ``<name>.weight_scale.<stream>`` tensors.
+Every decoder rebuilds the exact scale bytes of the uncompressed checkpoint.
 
-- ``<name>.nvfp4_csf_fixed`` (uint8, ``[rows // 16, 16 * (1 + cols // 2)]``):
-  per 16-row slab, one base byte per row followed by the rows' 4-bit codes,
-  two per byte, low nibble first. A scale byte is ``base + code``.
-- ``<name>.nvfp4_csf_exceptions`` (uint32): sorted words whose low 24 bits are
-  a flat ``row * cols + col`` position and whose high 8 bits replace the
-  scale byte there.
-
-The decoded bytes equal the uncompressed checkpoint's E4M3 scales exactly, so
-every NVFP4 kernel consumes them unchanged.
+- ``csf``: ``nvfp4_csf_fixed`` (uint8, ``[rows // 16, 16 * (1 + cols // 2)]``)
+  holds, per 16-row slab, one base byte per row followed by the rows' 4-bit
+  codes, two per byte, low nibble first; a scale byte is ``base + code``.
+  ``nvfp4_csf_exceptions`` (uint32) holds sorted words whose low 24 bits are a
+  flat ``row * cols + col`` position and whose high 8 bits replace that byte.
+- ``csf_32x2_v1``: ``csf32_bases`` (uint8, one per row) and ``csf32_codes``
+  (uint8, 4-bit codes) cover 32-row x 2-column blocks, grouped into 128 x 4
+  tiles, 32 tiles to a page. ``csf32_exceptions`` (uint16) holds the in-block
+  position in the low byte and the scale byte in the high byte;
+  ``csf32_page_bases`` (uint32, byte offset of each page's first exception)
+  and ``csf32_offsets`` (uint16, per page a 0 then each block's exception end)
+  index them.
 """
 
-from collections.abc import Iterable, Iterator
+import functools
+from collections.abc import Callable, Iterable, Iterator
 
 import numpy as np
 import torch
@@ -28,14 +33,11 @@ from vllm.logger import init_logger
 
 logger = init_logger(f"vllm.{__name__}")
 
-CSF_FIXED_SUFFIX = ".nvfp4_csf_fixed"
-CSF_EXCEPTIONS_SUFFIX = ".nvfp4_csf_exceptions"
+# numpy keeps these small ops off torch's intra-op thread pool, whose per-op
+# sync dominates when weight loading runs with many threads.
 
 
-def decode_nvfp4_csf_scale(
-    fixed: torch.Tensor, exceptions: torch.Tensor
-) -> torch.Tensor:
-    """Rebuild one ``[rows, cols]`` float8_e4m3fn block-scale matrix."""
+def _decode_csf(fixed: torch.Tensor, exceptions: torch.Tensor) -> np.ndarray:
     if fixed.dtype != torch.uint8 or fixed.dim() != 2 or fixed.shape[1] % 16:
         raise ValueError(f"Invalid CSF fixed stream {fixed.dtype} {fixed.shape}")
     if exceptions.dtype != torch.uint32:
@@ -44,44 +46,140 @@ def decode_nvfp4_csf_scale(
     cols = (fixed.shape[1] // 16 - 1) * 2
     if rows * cols > 1 << 24:
         raise ValueError("CSF scale exceeds 24-bit exception positions")
-    # numpy keeps these small ops off torch's intra-op thread pool, whose
-    # per-op sync dominates when weight loading runs with many threads.
-    raw = fixed.cpu().numpy()
+    raw = fixed.numpy()
     bases = raw[:, :16].reshape(rows, 1)
     if (bases > 240).any():
         raise ValueError("CSF row bases must be in 0..240")
     packed = raw[:, 16:].reshape(rows, cols // 2)
     codes = np.stack((packed & 0xF, packed >> 4), axis=-1).reshape(rows, cols)
     out = (bases + codes).reshape(-1)
-    words = exceptions.cpu().reshape(-1).numpy()
+    words = exceptions.reshape(-1).numpy()
     positions = words & 0xFFFFFF
     if positions.size and (
         positions[-1] >= rows * cols or (positions[1:] <= positions[:-1]).any()
     ):
         raise ValueError("CSF exception positions must be increasing and in range")
     out[positions] = words >> 24
-    return torch.from_numpy(out).view(torch.float8_e4m3fn).reshape(rows, cols)
+    return out.reshape(rows, cols)
+
+
+@functools.cache
+def _csf32_blocks(rows: int, cols: int):
+    """Origin, width and page of each 32x2 block in storage order, and the flat
+    ``[rows, cols]`` position of each code."""
+    tile_r, tile_c, pair, block = np.meshgrid(
+        np.arange(-(-rows // 128)),
+        np.arange(-(-cols // 4)),
+        np.arange(2),
+        np.arange(4),
+        indexing="ij",
+    )
+    r0 = (128 * tile_r + 32 * block).ravel()
+    c0 = (4 * tile_c + 2 * pair).ravel()
+    page = (tile_r * tile_c.shape[1] + tile_c).ravel() // 32
+    keep = (r0 < rows) & (c0 < cols)
+    r0, c0, page = r0[keep], c0[keep], page[keep]
+    width = np.minimum(cols - c0, 2)
+    i, j = np.meshgrid(np.arange(32), np.arange(2), indexing="ij")
+    cells = (r0[:, None, None] + i) * cols + c0[:, None, None] + j
+    return r0, c0, width, page, cells[j < width[:, None, None]]
+
+
+def _decode_csf_32x2(
+    bases: torch.Tensor,
+    codes: torch.Tensor,
+    page_bases: torch.Tensor,
+    offsets: torch.Tensor,
+    exceptions: torch.Tensor,
+) -> np.ndarray:
+    dtypes = (torch.uint8, torch.uint8, torch.uint32, torch.uint16, torch.uint16)
+    streams = (bases, codes, page_bases, offsets, exceptions)
+    rows = bases.numel()
+    cols = 2 * codes.numel() // max(rows, 1)
+    if (
+        any(t.dtype != d for t, d in zip(streams, dtypes))
+        or rows % 32
+        or rows * cols != 2 * codes.numel()
+        or cols == 0
+    ):
+        raise ValueError("Invalid csf_32x2_v1 streams")
+    r0, c0, width, page, cells = _csf32_blocks(rows, cols)
+    num_pages = int(page[-1]) + 1
+    base, packed, origins, index, words = (t.reshape(-1).numpy() for t in streams)
+    if origins.size != num_pages or index.size != r0.size + num_pages:
+        raise ValueError("Invalid csf_32x2_v1 index sizes")
+    if (base > 240).any():
+        raise ValueError("CSF row bases must be in 0..240")
+    out = np.empty(rows * cols, dtype=np.uint8)
+    out[cells] = np.stack((packed & 0xF, packed >> 4), -1).ravel() + base[cells // cols]
+
+    first = np.flatnonzero(np.diff(page, prepend=-1))
+    ends = origins[page].astype(np.int64) // 2 + index[np.arange(r0.size) + page + 1]
+    starts = np.concatenate(([0], ends[:-1]))
+    if (
+        (index[first + np.arange(num_pages)] != 0).any()
+        or (origins != 2 * starts[first]).any()
+        or (ends < starts).any()
+        or (ends - starts > 32 * width).any()
+        or ends[-1] != words.size
+    ):
+        raise ValueError("Invalid csf_32x2_v1 exception index")
+    block = np.repeat(np.arange(r0.size), ends - starts)
+    pos = (words & 0xFF).astype(np.int64)
+    if (
+        (pos >= 64).any()
+        or (pos % 2 >= width[block]).any()
+        or ((pos[1:] <= pos[:-1]) & (block[1:] == block[:-1])).any()
+    ):
+        raise ValueError("CSF exception positions must be increasing and in range")
+    out[(r0[block] + pos // 2) * cols + c0[block] + pos % 2] = words >> 8
+    return out.reshape(rows, cols)
+
+
+# weight_scale_encoding -> (stream suffixes in decoder argument order, decoder)
+CSF_SCALE_ENCODINGS: dict[str, tuple[tuple[str, ...], Callable[..., np.ndarray]]] = {
+    "csf": (("nvfp4_csf_fixed", "nvfp4_csf_exceptions"), _decode_csf),
+    "csf_32x2_v1": (
+        tuple(
+            f"csf32_{name}"
+            for name in ("bases", "codes", "page_bases", "offsets", "exceptions")
+        ),
+        _decode_csf_32x2,
+    ),
+}
+
+
+def decode_csf_scale(encoding: str, streams: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Rebuild one ``[rows, cols]`` float8_e4m3fn block-scale matrix."""
+    names, decode = CSF_SCALE_ENCODINGS[encoding]
+    out = decode(*(streams[name].cpu() for name in names))
+    return torch.from_numpy(out).view(torch.float8_e4m3fn)
+
+
+_ENCODING_OF_STREAM = {
+    name: encoding
+    for encoding, (names, _) in CSF_SCALE_ENCODINGS.items()
+    for name in names
+}
 
 
 def decode_csf_scale_streams(
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Replace CSF stream pairs with decoded ``<name>`` E4M3 scale tensors."""
+    """Replace each matrix's CSF streams with its decoded ``<name>`` scale."""
     pending: dict[str, dict[str, torch.Tensor]] = {}
     decoded = 0
     for name, tensor in weights:
-        if name.endswith(CSF_FIXED_SUFFIX):
-            base, part = name[: -len(CSF_FIXED_SUFFIX)], "fixed"
-        elif name.endswith(CSF_EXCEPTIONS_SUFFIX):
-            base, part = name[: -len(CSF_EXCEPTIONS_SUFFIX)], "exceptions"
-        else:
+        base, _, stream = name.rpartition(".")
+        encoding = _ENCODING_OF_STREAM.get(stream)
+        if encoding is None:
             yield name, tensor
             continue
-        parts = pending.setdefault(base, {})
-        parts[part] = tensor
-        if len(parts) == 2:
+        streams = pending.setdefault(base, {})
+        streams[stream] = tensor
+        if streams.keys() == set(CSF_SCALE_ENCODINGS[encoding][0]):
             del pending[base]
-            yield base, decode_nvfp4_csf_scale(parts["fixed"], parts["exceptions"])
+            yield base, decode_csf_scale(encoding, streams)
             decoded += 1
     if pending:
         raise ValueError(f"CSF scale streams without a partner: {sorted(pending)[:4]}")

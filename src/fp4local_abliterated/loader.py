@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Teach vLLM's default loader the FP4-Local checkpoint layout.
 
-FP4-Local keeps its safetensors shards under ``tensors/`` (listed by the root
-index) and stores expert block scales CSF-compressed. Both changes come from
-vLLM pull request #60646; this patch is skipped once vLLM ships them.
+FP4-Local keeps some or all of its safetensors shards under ``tensors/``
+(listed by the root index) and stores expert block scales CSF-compressed.
+vLLM pull requests #64739 and #64312 add both. The shard lookup changes
+nothing once vLLM finds those shards itself, and the CSF decoding is skipped
+once vLLM has its own decoders.
 """
 
 import importlib.util
@@ -30,18 +32,21 @@ def _indexed_safetensors_files(hf_folder: str, index_file: str) -> list[str]:
 
 
 def patch_default_loader() -> None:
-    if importlib.util.find_spec("vllm.model_executor.model_loader.csf_scales"):
-        return
-
     from vllm.model_executor.model_loader import default_loader as dl
-
-    from .csf_scales import decode_csf_scale_streams
+    from vllm.model_executor.model_loader.weight_cache import protocol
 
     loader_cls = dl.DefaultModelLoader
     if getattr(loader_cls, "_fp4local_patched", False):
         return
+    filter_files = dl.filter_duplicate_safetensors_files
     prepare_weights = loader_cls._prepare_weights
-    get_weights_iterator = loader_cls._get_weights_iterator
+
+    def filter_duplicate_safetensors_files(hf_weights_files, hf_folder, index_file):
+        # Add the shards the index lists in a subdirectory; vLLM's filter then
+        # keeps the listed files and fails on any that are missing.
+        listed = _indexed_safetensors_files(hf_folder, index_file)
+        files = hf_weights_files + [f for f in listed if f not in hf_weights_files]
+        return filter_files(files, hf_folder, index_file)
 
     def _prepare_weights(
         self,
@@ -88,15 +93,27 @@ def patch_default_loader() -> None:
                 )
             if subfolder is not None:
                 hf_folder = os.path.join(hf_folder, subfolder)
-            files = _indexed_safetensors_files(hf_folder, SAFE_WEIGHTS_INDEX_NAME)
+            files = filter_duplicate_safetensors_files(
+                [], hf_folder, SAFE_WEIGHTS_INDEX_NAME
+            )
             if not files:
                 raise
             return hf_folder, files, True, SAFE_WEIGHTS_INDEX_NAME
 
-    def _get_weights_iterator(self, source):
-        return decode_csf_scale_streams(get_weights_iterator(self, source))
-
+    # The IPC weight cache keys on the same files.
+    dl.filter_duplicate_safetensors_files = filter_duplicate_safetensors_files
+    protocol.filter_duplicate_safetensors_files = filter_duplicate_safetensors_files
     loader_cls._prepare_weights = _prepare_weights
-    loader_cls._get_weights_iterator = _get_weights_iterator
+    if not importlib.util.find_spec(
+        "vllm.model_executor.layers.quantization.utils.csf_scales"
+    ):
+        from .csf_scales import decode_csf_scale_streams
+
+        get_weights_iterator = loader_cls._get_weights_iterator
+
+        def _get_weights_iterator(self, source):
+            return decode_csf_scale_streams(get_weights_iterator(self, source))
+
+        loader_cls._get_weights_iterator = _get_weights_iterator
     loader_cls._fp4local_patched = True
     logger.debug("Patched DefaultModelLoader for subdirectory shards and CSF scales")

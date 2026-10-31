@@ -4,8 +4,9 @@
 - Applies abliteration when config.json carries an ``abliteration_config``
   block (see the ``fp4local-abliterate`` CLI). Without it the model runs
   unchanged.
-- Loads FP4-Local's CSF-compressed NVFP4 block scales and subdirectory shards,
-  until vLLM does this itself.
+- Loads FP4-Local's CSF-compressed NVFP4 block scales (``csf`` and
+  ``csf_32x2_v1``) and the shards its index lists under ``tensors/``, until
+  vLLM does this itself.
 """
 
 from .adapters import ADAPTERS

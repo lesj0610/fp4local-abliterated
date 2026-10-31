@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fp4local-abliterated"
-version = "0.1.0"
+version = "0.2.0"
 description = "vLLM plugin for inference-time abliteration, with FP4-Local checkpoint loading"
 readme = "README.md"
 license = "Apache-2.0"
